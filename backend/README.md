@@ -7,6 +7,12 @@ git clone https://github.com/HappySR/rtvat-og.git
 cd backend
 ```
 
+Now create a temp folder in the backend folder using the following command:
+
+```bash
+mkdir temp # for Linux
+```
+
 To start testing your application after implementing the code, follow these steps:
 
 ## 1. Set Up Your Environment:
