@@ -17,7 +17,7 @@ To start testing your application after implementing the code, follow these step
 ## 2. Create a Virtual Environment (optional but recommended):
 
 ```bash
-python -m venv env
+python -m venv env # Or, python3 -m venv env
 source env/bin/activate  # On Windows use 'env\Scripts\activate'
 pip install -r requirements.txt
 ```
