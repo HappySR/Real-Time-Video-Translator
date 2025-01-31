@@ -48,13 +48,3 @@ Now you are ready to go to the next step!
 python app.py
 ```
 This will start your Flask server on http://127.0.0.1:5000.
-
-## 4. Set Up Your Flutter Environment:
-• Flutter Installation: Ensure you have Flutter installed and set up on your machine.
-• Navigate to Flutter App Directory: Go to the flutter_app directory.
-
-## 5. Run Your Flutter Application:
-
-```bash
-flutter run
-```
