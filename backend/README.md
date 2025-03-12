@@ -38,6 +38,9 @@ Then run the following command:
 
 ```bash
 pip install -r requirements.txt
+tts --download_model tts_models/multilingual/multi-dataset/xtts_v2
+pip uninstall torch torchaudio -y
+pip install torch==2.5.0 torchaudio==2.5.0
 ```
 
 Once the depndencies are successfully configured, run the following command to list the current dependencies of your environment:
