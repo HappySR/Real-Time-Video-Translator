@@ -3,6 +3,7 @@ import asyncio
 import subprocess
 import torch
 import os
+from pydub import AudioSegment
 
 # LibreTranslate endpoint
 LIBRETRANSLATE_URL = "http://127.0.0.1:5000/detect"
@@ -36,61 +37,133 @@ async def detect_language(text):
             print(f"🚨 Language detection failed: {e}")
             return "en"
 
-async def text_to_speech(text, output_audio_path, target_language=None, max_retries=3):
-    """Converts text to speech with retry logic"""
+async def generate_tts_segments(chunks: list, output_dir: str, target_language: str) -> list:
+    """
+    Generate TTS audio for complete subtitle chunks
+    Args:
+        chunks: List of {'texts': list, 'start': float, 'end': float}
+        output_dir: Output directory
+        target_language: Target language code
+    Returns:
+        List of (audio_path, start, end)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    results = []
+
+    for idx, chunk in enumerate(chunks):
+        try:
+            # Combine all phrases in the chunk
+            full_text = " ".join(chunk["texts"])
+            duration = chunk["end"] - chunk["start"]
+            
+            output_path = os.path.join(
+                output_dir,
+                f"chunk_{idx}_{chunk['start']:.2f}-{chunk['end']:.2f}.wav"
+            )
+
+            success = await text_to_speech(
+                text=full_text,
+                output_audio_path=output_path,
+                target_language=target_language,
+                duration=duration
+            )
+            
+            if success:
+                results.append((output_path, chunk["start"], chunk["end"]))
+
+        except Exception as e:
+            print(f"⚠️ Failed to generate TTS for chunk {idx}: {e}")
+
+    return results
+
+# Modified text_to_speech function
+async def text_to_speech(text, output_audio_path, target_language=None, duration=None, max_retries=3):
+    """Converts text to speech with post-processing duration control"""
     try:
         if not text.strip():
             raise ValueError("❌ Empty text input for TTS")
 
-        # Validate speaker file exists
         if not os.path.exists(SPEAKER_WAV):
             raise FileNotFoundError(f"❌ Speaker WAV file not found: {SPEAKER_WAV}")
 
-        # Determine language code
         detected_lang = target_language if target_language else await detect_language(text)
         coqui_lang = LANGUAGE_MAP.get(detected_lang.lower(), "en")
 
-        # Determine CUDA availability
-        use_cuda = "true" if torch.cuda.is_available() else "false"
+        command = [
+            "tts",
+            "--model_name", "tts_models/multilingual/multi-dataset/xtts_v2",
+            "--text", text,
+            "--out_path", output_audio_path,
+            "--speaker_wav", SPEAKER_WAV,
+            "--language_idx", coqui_lang
+        ]
 
+        if torch.cuda.is_available():
+            command += ["--use_cuda", "true"]
+
+        # Generate initial TTS without speed adjustment
         for attempt in range(max_retries):
             try:
-                command = [
-                    "tts",
-                    "--model_name", "tts_models/multilingual/multi-dataset/xtts_v2",
-                    "--text", text,
-                    "--out_path", output_audio_path,
-                    "--use_cuda", use_cuda,
-                    "--speaker_wav", SPEAKER_WAV,
-                    "--language_idx", coqui_lang,  # Using correct parameter name
-                    # "--output_sample_rate", "44100"
-                ]
-
                 print(f"🔊 TTS attempt {attempt + 1} for: {text[:50]}...")
+                
                 process = await asyncio.create_subprocess_exec(
                     *command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
                 )
                 
                 stdout, stderr = await process.communicate()
                 
-                if process.returncode == 0:
-                    if os.path.exists(output_audio_path):
-                        print(f"✅ TTS successful: {output_audio_path}")
-                        return output_audio_path
-                    else:
-                        raise FileNotFoundError("TTS output file not created")
-                else:
-                    raise RuntimeError(stderr.decode().strip())
-
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise RuntimeError(f"❌ TTS failed after {max_retries} attempts: {str(e)}")
+                if process.returncode == 0 and os.path.exists(output_audio_path):
+                    # Post-process speed adjustment if duration is specified
+                    if duration and duration > 0:
+                        adjust_audio_speed(output_audio_path, duration)
+                    print(f"✅ TTS successful: {output_audio_path}")
+                    return True
                 
-                print(f"⚠️ TTS attempt {attempt + 1} failed, retrying...")
-                await asyncio.sleep(1)  # Wait before retrying
+                print(f"❌ TTS error: {stderr.decode().strip()}")
+                
+            except Exception as e:
+                print(f"⚠️ TTS attempt {attempt + 1} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"❌ TTS failed after {max_retries} attempts")
+                await asyncio.sleep(1)
+
+        return False
+    except Exception as e:
+        print(f"❌ Final TTS error: {str(e)}")
+        return False
+
+def adjust_audio_speed(file_path, target_duration):
+    """Adjust audio speed with safety checks"""
+    try:
+        if target_duration <= 0.1:  # Minimum 100ms duration
+            print("⏩ Skipping invalid target duration")
+            return
+
+        audio = AudioSegment.from_file(file_path)
+        current_duration = len(audio) / 1000
+        
+        if current_duration <= 0.1:
+            print("⏩ Invalid audio duration")
+            return
+
+        speed_factor = current_duration / target_duration
+        speed_factor = max(0.5, min(2.0, speed_factor))
+
+        # Preserve audio characteristics
+        adjusted = audio.speedup(
+            playback_speed=speed_factor,
+            chunk_size=150,  # Smoother speed adjustment
+            crossfade=25     # Prevent audio artifacts
+        )
+        
+        # Ensure exact duration
+        if len(adjusted) > target_duration * 1000:
+            adjusted = adjusted[:int(target_duration * 1000)]
+            
+        adjusted.export(file_path, format="wav")
+        print(f"⚡ Adjusted {os.path.basename(file_path)} by {speed_factor:.2f}x")
 
     except Exception as e:
-        print(f"❌ Final TTS error: {e}")
-        raise
+        print(f"⚠️ Speed adjustment failed: {str(e)}")

@@ -3,13 +3,12 @@ import os
 import shutil
 import asyncio
 import ffmpeg
-import re
 from text_to_speech import LANGUAGE_MAP
 from extract_audio import extract_audio
 from transcribe_audio import transcribe_audio
 from translate_text import translate_text
 from generate_subtitles import generate_srt
-from text_to_speech import text_to_speech
+from text_to_speech import generate_tts_segments
 from merge_audio_with_video import merge_audio_with_video, merge_audio_segments
 
 app = FastAPI()
@@ -17,80 +16,42 @@ app = FastAPI()
 TEMP_DIR = os.path.abspath("temp")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-def split_sentences_with_timing(segments):
-    """Split segments into sentences with accurate timing"""
-    sentence_segments = []
+def _group_segments_into_chunks(segments: list) -> list:
+    """
+    Groups segments into timing-preserved chunks for TTS generation.
+    
+    Args:
+        segments: List of transcribed segments
+        
+    Returns:
+        List of chunks with combined text and original timing
+    """
+    chunks = []
+    current_chunk = None
     
     for segment in segments:
-        text = segment["text"].strip()
-        start = segment["start"]
-        end = segment["end"]
-        
-        if not text:
-            continue
-            
-        # Split into sentences while preserving timing
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        sentence_count = len(sentences)
-        
-        if sentence_count == 0:
-            continue
-        elif sentence_count == 1:
-            # Single sentence, use original timing
-            sentence_segments.append({
-                "start": start,
-                "end": end,
-                "text": text
-            })
+        if not current_chunk:
+            current_chunk = {
+                "texts": [segment["text"]],
+                "start": segment["start"],
+                "end": segment["end"]
+            }
         else:
-            # Multiple sentences, distribute time proportionally
-            total_duration = end - start
-            words = text.split()
-            word_count = len(words)
-            
-            if word_count == 0:
-                continue
-                
-            # Calculate word durations
-            word_durations = []
-            current_word_start = start
-            for i, word in enumerate(words):
-                if i < len(words) - 1:
-                    word_end = start + (i+1) * (total_duration / word_count)
-                else:
-                    word_end = end
-                word_durations.append((current_word_start, word_end))
-                current_word_start = word_end
-            
-            # Reconstruct sentences with proper timing
-            current_sentence = []
-            current_sentence_start = None
-            word_index = 0
-            
-            for sentence in sentences:
-                sentence_words = sentence.split()
-                sentence_word_count = len(sentence_words)
-                
-                if sentence_word_count == 0:
-                    continue
-                    
-                # Get timing for first word in sentence
-                first_word_start = word_durations[word_index][0]
-                if current_sentence_start is None:
-                    current_sentence_start = first_word_start
-                
-                # Get timing for last word in sentence
-                last_word_end = word_durations[word_index + sentence_word_count - 1][1]
-                
-                sentence_segments.append({
-                    "start": first_word_start,
-                    "end": last_word_end,
-                    "text": sentence
-                })
-                
-                word_index += sentence_word_count
+            # Merge if within the same timing block (same start/end)
+            if segment["start"] == current_chunk["start"] and segment["end"] == current_chunk["end"]:
+                current_chunk["texts"].append(segment["text"])
+            else:
+                chunks.append(current_chunk)
+                current_chunk = {
+                    "texts": [segment["text"]],
+                    "start": segment["start"],
+                    "end": segment["end"]
+                }
     
-    return sentence_segments
+    if current_chunk:
+        chunks.append(current_chunk)
+        
+    return chunks
 
 @app.post("/process_video")
 async def process_video(
@@ -101,7 +62,6 @@ async def process_video(
     audio_path = None
     srt_path_en = None
     srt_path_translated = None
-    segment_tts_paths = []
     merged_tts_path = None
     final_video_no_audio = None
     final_dubbed_video = None
@@ -133,67 +93,54 @@ async def process_video(
         if not segments:
             raise HTTPException(status_code=500, detail="Audio transcription failed")
 
-        # Split into proper sentences with accurate timing
-        sentence_segments = split_sentences_with_timing(segments)
-
-        # Generate English subtitles
+        # Generate English subtitles (preserve original timing chunks)
         srt_path_en = video_path.rsplit(".", 1)[0] + "_en.srt"
-        await generate_srt(sentence_segments, srt_path_en)
+        await generate_srt(segments, srt_path_en)
 
-        # Translate segments
-        translated_segments = []
-        for segment in sentence_segments:
+        # Translate segments while preserving timing chunks
+        translated_chunks = []
+        original_chunks = _group_segments_into_chunks(segments)
+        
+        for chunk in original_chunks:
             try:
-                translation_result = await translate_text(segment["text"], target_language)
+                # Combine all text in the chunk for translation
+                combined_text = " ".join(chunk["texts"])
+                translation_result = await translate_text(combined_text, target_language)
                 translated_text = translation_result["translated_text"]
                 
                 # Handle both string and list responses
                 if isinstance(translated_text, list):
-                    # If we get a list of translations, join them with spaces
                     translated_text = " ".join([str(t) for t in translated_text])
                 
                 # Clean and validate
-                translated_text = str(translated_text).replace("\n", " ").strip()[:500]  # Ensure string and limit length
+                translated_text = str(translated_text).replace("\n", " ").strip()[:500]
 
-                translated_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "text": translated_text
+                translated_chunks.append({
+                    "texts": [translated_text],
+                    "start": chunk["start"],
+                    "end": chunk["end"]
                 })
             except Exception as e:
                 print(f"⚠️ Translation error: {e}")
-                translated_segments.append(segment)  # Fallback to original
+                translated_chunks.append(chunk)  # Fallback to original
 
         # Generate translated subtitles
         srt_path_translated = video_path.rsplit(".", 1)[0] + f"_{target_language}.srt"
+        translated_segments = []
+        for chunk in translated_chunks:
+            translated_segments.append({
+                "text": " ".join(chunk["texts"]),
+                "start": chunk["start"],
+                "end": chunk["end"]
+            })
         await generate_srt(translated_segments, srt_path_translated)
 
-        # Process TTS for complete segments
-        for idx, segment in enumerate(translated_segments):
-            try:
-                segment_path = os.path.join(
-                    TEMP_DIR,
-                    f"{os.path.basename(video_path).rsplit('.', 1)[0]}_{target_language}_seg_{idx}.mp3"
-                )
-                
-                if not segment["text"].strip():
-                    print(f"⚠️ Skipping empty segment {idx}")
-                    continue
-                
-                if await text_to_speech(
-                    text=segment["text"],
-                    output_audio_path=segment_path,
-                    target_language=target_language
-                ):
-                    segment_tts_paths.append((
-                        segment_path,
-                        segment["start"],
-                        segment["end"]
-                    ))
-
-            except Exception as e:
-                print(f"⚠️ TTS error for segment {idx}: {e}")
-                continue
+        # Process TTS for complete chunks (preserving timing blocks)
+        segment_tts_paths = await generate_tts_segments(
+            translated_chunks,
+            TEMP_DIR,
+            target_language
+        )
 
         # Merge audio segments
         if segment_tts_paths:
@@ -247,7 +194,7 @@ async def process_video(
         cleanup_files = [
             video_path, audio_path, srt_path_en, srt_path_translated,
             merged_tts_path, final_video_no_audio
-        ] + [seg[0] for seg in segment_tts_paths if seg and seg[0]]
+        ] + [seg[0] for seg in (segment_tts_paths or []) if seg and seg[0]]
 
         for file in cleanup_files:
             safe_remove(file)

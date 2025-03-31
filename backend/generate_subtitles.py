@@ -2,7 +2,6 @@ import asyncio
 import os
 import httpx
 import logging
-import re
 from typing import List, Dict
 
 # Set up logging
@@ -11,11 +10,10 @@ logger = logging.getLogger(__name__)
 
 LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://127.0.0.1:5000/translate")
 MAX_TEXT_LENGTH = 500  # LibreTranslate API limit
-MAX_PHRASE_GAP = 1.0  # Maximum gap between words to merge into same subtitle
 
 async def generate_srt(segments: List[Dict], output_path: str, target_lang: str = None, source_lang: str = "auto") -> str:
     """
-    Generates an SRT file with proper sentence segmentation and accurate timing.
+    Generates an SRT file while preserving original timing chunks.
     
     Args:
         segments: List of segments with start/end times and text
@@ -37,19 +35,8 @@ async def generate_srt(segments: List[Dict], output_path: str, target_lang: str 
             for i, seg in enumerate(segments):
                 seg["text"] = translated[i]
 
-        # Split into proper sentences with timing
-        sentence_segments = []
-        for segment in segments:
-            sentence_segments.extend(
-                _split_into_sentences(
-                    segment["text"],
-                    segment["start"],
-                    segment["end"]
-                )
-            )
-
-        # Merge short consecutive segments
-        merged_segments = _merge_short_segments(sentence_segments)
+        # Group segments into timing-preserved chunks
+        merged_segments = _group_segments_by_timing(segments)
 
         # Write to SRT file
         await asyncio.to_thread(_write_srt_file, merged_segments, output_path)
@@ -60,82 +47,46 @@ async def generate_srt(segments: List[Dict], output_path: str, target_lang: str 
         logger.error(f"❌ Error generating subtitles: {e}")
         raise
 
-def _split_into_sentences(text: str, start_time: float, end_time: float) -> List[Dict]:
+def _group_segments_by_timing(segments: List[Dict]) -> List[Dict]:
     """
-    Split text into sentences with smart timing using speech rate calculation.
-    Maintains original segment duration while creating natural pauses.
-    """
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    if not sentences:
-        return []
-    
-    # Calculate speech rate (characters per second) for timing distribution
-    total_chars = sum(len(s) for s in sentences)
-    total_duration = end_time - start_time
-    speech_rate = total_chars / total_duration if total_duration > 0 else 15  # Fallback to 15 cps
-    
-    sentence_segments = []
-    current_start = start_time
-    
-    for sentence in sentences:
-        if not sentence:
-            continue
-            
-        # Calculate duration based on actual speech rate
-        sentence_duration = len(sentence) / speech_rate
-        
-        # Add natural pause after punctuation
-        pause_duration = 0.4 if sentence.endswith(('.', '!', '?')) else 0.2
-        
-        current_end = current_start + sentence_duration + pause_duration
-        
-        # Ensure we don't exceed original segment duration
-        if current_end > end_time:
-            current_end = end_time
-            
-        sentence_segments.append({
-            "text": sentence,
-            "start": current_start,
-            "end": current_end
-        })
-        
-        # Next sentence starts after pause
-        current_start = current_end + 0.1  # Small buffer
-    
-    # Adjust last sentence to match original end time
-    if sentence_segments:
-        sentence_segments[-1]["end"] = end_time
-    
-    return sentence_segments
-
-def _merge_short_segments(segments: List[Dict]) -> List[Dict]:
-    """
-    Merge very short consecutive segments for better readability.
+    Groups segments into chunks based on original timing blocks.
     
     Args:
-        segments: List of sentence segments
+        segments: List of individual segments
         
     Returns:
-        List of merged segments
+        List of merged segments preserving original timing blocks
     """
     if not segments:
         return []
         
-    merged = []
-    current_segment = segments[0].copy()
+    # Group segments that share the same timing block
+    chunks = []
+    current_chunk = None
     
-    for segment in segments[1:]:
-        # Merge if gap is small and combined text isn't too long
-        if (segment["start"] - current_segment["end"] <= MAX_PHRASE_GAP and 
-            len(current_segment["text"]) + len(segment["text"]) < 80):
-            current_segment["text"] += " " + segment["text"]
-            current_segment["end"] = segment["end"]
+    for segment in segments:
+        if not current_chunk:
+            current_chunk = {
+                "text": segment["text"],
+                "start": segment["start"],
+                "end": segment["end"]
+            }
         else:
-            merged.append(current_segment)
-            current_segment = segment.copy()
+            # Merge if within the same timing block (same start/end)
+            if segment["start"] == current_chunk["start"] and segment["end"] == current_chunk["end"]:
+                current_chunk["text"] += " " + segment["text"]
+            else:
+                chunks.append(current_chunk)
+                current_chunk = {
+                    "text": segment["text"],
+                    "start": segment["start"],
+                    "end": segment["end"]
+                }
     
-    merged.append(current_segment)
-    return merged
+    if current_chunk:
+        chunks.append(current_chunk)
+        
+    return chunks
 
 def _write_srt_file(segments: List[Dict], output_path: str):
     """
@@ -164,7 +115,7 @@ def _format_time(seconds: float) -> str:
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     seconds = seconds % 60
-    milliseconds = int(seconds - int(seconds)) * 1000
+    milliseconds = int((seconds - int(seconds)) * 1000)
     return f"{hours:02}:{minutes:02}:{int(seconds):02},{milliseconds:03}"
 
 async def translate_subtitles(texts: List[str], target_lang: str, source_lang: str = "auto", retries: int = 3) -> List[str]:
