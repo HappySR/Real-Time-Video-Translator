@@ -2,29 +2,38 @@ import httpx
 import asyncio
 import os
 import logging
+import re
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://127.0.0.1:5000/translate")
-MAX_TEXT_LENGTH = 500  # Prevents large requests from failing
-RETRY_ATTEMPTS = 3     # Number of retries
-TIMEOUT = 15.0         # Request timeout (seconds)
+MAX_TEXT_LENGTH = 500
+RETRY_ATTEMPTS = 3
+TIMEOUT = 15.0
+
+def clean_text(text):
+    """Clean text while preserving essential characters and content"""
+    # Allow Hindi, Latin letters, numbers, and basic punctuation
+    allowed_chars = r"[\u0900-\u097F\w\s.,!?।0-9]"
+    cleaned = re.sub(fr"[^{allowed_chars}]", '', str(text))
+    
+    # Normalize spaces and remove leading/trailing spaces
+    cleaned = ' '.join(cleaned.split())
+    
+    # Preserve original if cleaning removes all meaningful content
+    if len(cleaned.strip()) < 1:
+        return text.strip()
+    return cleaned
 
 async def translate_text(text, target_lang, source_lang="auto"):
     """
-    Translates text using LibreTranslate.
-
-    - Supports single string, list of strings, or nested lists.
-    - Automatically chunks large text.
-    - Implements retry logic.
-    - Maintains input structure in output.
+    Translates text using LibreTranslate with careful content preservation.
     """
     if not text:
         raise ValueError("❌ Input text is empty.")
 
-    # Normalize input: Convert all text into a flattened list while keeping track of structure
     def flatten_text(data):
         structure = []
         flat_list = []
@@ -36,24 +45,25 @@ async def translate_text(text, target_lang, source_lang="auto"):
                     sub_structure.append(recurse(item))
                 structure.append(sub_structure)
             else:
+                original = str(sub_data)
+                cleaned = clean_text(original)
+                # Preserve original if cleaning removes too much
+                final_text = cleaned if len(cleaned) > len(original)*0.5 else original
                 sub_structure = len(flat_list)
-                flat_list.append(sub_data)
+                flat_list.append(final_text)
                 structure.append(sub_structure)
             return sub_structure
 
         recurse(data)
         return flat_list, structure
 
-    # Restore original structure
     def restore_structure(flat_translations, structure):
         def recurse(struct):
             if isinstance(struct, list):
                 return [recurse(sub_struct) for sub_struct in struct]
             return flat_translations[struct]
-
         return recurse(structure)
 
-    # Flatten input text while preserving structure
     text_list, structure = flatten_text(text)
 
     # Split long texts into smaller chunks
@@ -66,7 +76,6 @@ async def translate_text(text, target_lang, source_lang="auto"):
 
     translated_chunks = []
 
-    # Perform translation with retries
     for attempt in range(RETRY_ATTEMPTS):
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             try:
@@ -77,7 +86,6 @@ async def translate_text(text, target_lang, source_lang="auto"):
                 response.raise_for_status()
                 response_data = response.json()
 
-                # Ensure we always get a list of translations
                 if isinstance(response_data, list):
                     translated_chunks = [item.get("translatedText", "") for item in response_data]
                 elif isinstance(response_data, dict) and "translatedText" in response_data:
@@ -85,7 +93,7 @@ async def translate_text(text, target_lang, source_lang="auto"):
                 else:
                     raise ValueError(f"🚨 Unexpected API response: {response_data}")
 
-                break  # Exit retry loop if successful
+                break
 
             except httpx.HTTPStatusError as http_err:
                 logger.warning(f"🚨 HTTP error (attempt {attempt+1}): {http_err.response.status_code} - {http_err.response.text}")
@@ -97,7 +105,6 @@ async def translate_text(text, target_lang, source_lang="auto"):
             if attempt == RETRY_ATTEMPTS - 1:
                 raise Exception("🚨 Translation failed after multiple retries.")
 
-    # Restore the original structure
     reconstructed_translations = restore_structure(translated_chunks, structure)
 
     return {

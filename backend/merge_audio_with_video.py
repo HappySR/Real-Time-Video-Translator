@@ -2,72 +2,82 @@ import asyncio
 import ffmpeg
 import os
 import uuid
+import subprocess
 
 TEMP_DIR = "temp/"
 os.makedirs(TEMP_DIR, exist_ok=True)  # Ensure temp directory exists
 
 async def merge_audio_segments(audio_segments, output_audio):
-    """Merges multiple audio segments into a single MP3 file while ensuring format consistency."""
+    """Merges audio segments with proper path handling"""
     try:
-        if not audio_segments:
-            raise ValueError("No audio segments provided for merging.")
+        # Create absolute paths for all temporary files
+        TEMP_DIR = os.path.abspath("temp")
+        os.makedirs(TEMP_DIR, exist_ok=True)
 
-        concat_list_path = os.path.join(TEMP_DIR, "concat_list.txt")
-        converted_segments = []  # Store paths of converted MP3 files
+        # Generate unique temporary list file with absolute path
+        concat_list = os.path.join(TEMP_DIR, f"concat_{uuid.uuid4().hex}.txt")
+        temp_files = []
 
-        print("🔍 Debugging Audio Segments Paths:")
-        for segment in audio_segments:
-            if isinstance(segment, tuple):
-                segment = segment[0]  # Extract only the file path from tuple
+        # Write valid segments with absolute paths
+        with open(concat_list, "w") as f:
+            for seg in audio_segments:
+                if isinstance(seg, tuple):
+                    seg_path = seg[0]
+                else:
+                    seg_path = seg
+                
+                # Normalize and verify path
+                seg_path = os.path.abspath(os.path.normpath(seg_path))
+                if not os.path.exists(seg_path):
+                    continue
 
-            segment_path = os.path.normpath(segment)  # Normalize path
-            if not os.path.isabs(segment_path):  
-                segment_path = os.path.join(TEMP_DIR, os.path.basename(segment))  # Ensure correct path
+                # Create converted file with absolute path
+                temp_file = os.path.join(TEMP_DIR, f"conv_{uuid.uuid4().hex}.mp3")
+                temp_files.append(temp_file)
 
-            if not os.path.exists(segment_path):
-                raise FileNotFoundError(f"⚠️ Audio segment not found: {segment_path}")
+                # Convert to consistent format
+                convert_cmd = [
+                    "ffmpeg", "-y", "-i", seg_path,
+                    "-acodec", "libmp3lame", "-ar", "44100",
+                    "-ac", "1", "-b:a", "192k", temp_file
+                ]
+                process = await asyncio.create_subprocess_exec(*convert_cmd)
+                await process.wait()
+                
+                # Verify conversion succeeded
+                if os.path.exists(temp_file):
+                    f.write(f"file '{temp_file}'\n")
+                else:
+                    print(f"⚠️ Failed to convert {seg_path}")
 
-            # Convert all audio files to standardized MP3 format
-            converted_segment = os.path.join(TEMP_DIR, f"converted_{uuid.uuid4().hex}.mp3")
-            convert_command = [
-                "ffmpeg", "-y", "-i", segment_path, "-acodec", "libmp3lame", "-ar", "24000", "-b:a", "128k", converted_segment
-            ]
-            process_convert = await asyncio.create_subprocess_exec(*convert_command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            await process_convert.communicate()
-
-            if process_convert.returncode != 0:
-                raise RuntimeError(f"⚠️ Error converting audio: {segment_path}")
-
-            converted_segments.append(converted_segment)
-
-        # Write to concat_list.txt (ONLY file names, NO 'temp/' prefix)
-        with open(concat_list_path, "w", encoding="utf-8") as f:
-            for segment in converted_segments:
-                f.write(f"file '{os.path.basename(segment)}'\n")  # ✅ FIXED
-
-        # Merge audio using FFmpeg
-        merge_command = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path,
-            "-c", "copy", output_audio
+        # Merge using absolute paths
+        command = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", concat_list, "-c:a", "copy", output_audio
         ]
-        process_merge = await asyncio.create_subprocess_exec(*merge_command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, stderr = await process_merge.communicate()
+        
+        process = await asyncio.create_subprocess_exec(*command)
+        await process.wait()
 
-        if process_merge.returncode == 0:
-            print(f"✅ Merged audio segments successfully: {output_audio}")
-            os.remove(concat_list_path)  # Clean up temp file list
+        # Cleanup temporary files
+        for f in temp_files + [concat_list]:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except Exception as e:
+                print(f"⚠️ Error cleaning up {f}: {e}")
 
-            # Remove temp converted files
-            for file in converted_segments:
-                os.remove(file) if os.path.exists(file) else None
-
-            return output_audio
-        else:
-            print(f"⚠️ Error merging audio segments: {stderr.decode().strip()}")
-            raise RuntimeError(stderr.decode().strip())
+        return output_audio
 
     except Exception as e:
-        print(f"⚠️ Exception in merge_audio_segments: {e}")
+        print(f"⚠️ Error merging audio: {e}")
+        # Cleanup on error
+        for f in temp_files + [concat_list]:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except:
+                pass
         raise
 
 async def adjust_audio_duration(segment_path, target_duration):
@@ -115,57 +125,104 @@ async def merge_audio_with_video(video_no_audio, subtitle_data, audio_segments, 
     """Processes and merges adjusted audio segments into the video at their correct timestamps."""
     try:
         adjusted_segments = []
+        temp_files = []
 
-        for (segment_path, start_time, end_time) in audio_segments:
+        # 1. Adjust durations for all segments
+        for segment_path, start_time, end_time in audio_segments:
             target_duration = end_time - start_time
             adjusted_segment = await adjust_audio_duration(segment_path, target_duration)
             adjusted_segments.append((adjusted_segment, start_time))
+            temp_files.append(adjusted_segment)
 
-        # Generate silent base audio with the same length as the video
-        video_info = ffmpeg.probe(video_no_audio)
+        # 2. Generate silent audio base
+        video_info = await asyncio.to_thread(ffmpeg.probe, video_no_audio)
         video_duration = float(video_info["format"]["duration"])
-        silent_audio = os.path.join(TEMP_DIR, "silent_audio.mp3")
-        await asyncio.create_subprocess_exec(
+        silent_audio = os.path.join(TEMP_DIR, "silent_audio.wav")
+        
+        # Create silent audio with standardized format
+        silent_process = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-f", "lavfi", "-t", str(video_duration),
-            "-i", "anullsrc=channel_layout=stereo:sample_rate=24000",
-            "-q:a", "9", "-acodec", "libmp3lame", silent_audio
+            "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", silent_audio
         )
+        await silent_process.wait()
+        temp_files.append(silent_audio)
 
-        # Overlay adjusted audio segments onto the silent audio
-        overlay_filter = "".join(
-            f"[{i}:a]adelay={int(start_time * 1000)}|{int(start_time * 1000)}[a{i}];"
-            for i, (_, start_time) in enumerate(adjusted_segments)
-        )
-        input_files = [silent_audio] + [seg[0] for seg in adjusted_segments]
-        filter_complex = overlay_filter + "".join(f"[a{i}]" for i in range(len(adjusted_segments))) + "amix=inputs=" + str(len(adjusted_segments) + 1) + "[aout]"
+        # 3. Convert all segments to WAV with consistent format
+        converted_segments = []
+        for seg_path, start_time in adjusted_segments:
+            wav_path = seg_path.replace(".mp3", ".wav")
+            convert_cmd = [
+                "ffmpeg", "-y", "-i", seg_path,
+                "-ac", "1", "-ar", "44100",  # Force mono and consistent sample rate
+                wav_path
+            ]
+            process = await asyncio.create_subprocess_exec(*convert_cmd)
+            await process.wait()
+            converted_segments.append((wav_path, start_time))
+            temp_files.append(wav_path)
 
-        final_audio = os.path.join(TEMP_DIR, "final_audio.mp3")
-        merge_command = [
-            "ffmpeg", "-y",
-            *sum([["-i", f] for f in input_files], []),  # Add input files dynamically
-            "-filter_complex", filter_complex,
-            "-map", "[aout]", "-acodec", "libmp3lame", "-q:a", "4", final_audio
-        ]
-        process_merge = await asyncio.create_subprocess_exec(*merge_command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        await process_merge.communicate()
-
-        if not os.path.exists(final_audio):
-            raise RuntimeError("⚠️ Failed to merge adjusted audio segments!")
-
-        # Merge final audio with the video
-        merge_video_command = [
-            "ffmpeg", "-y", "-i", video_no_audio, "-i", final_audio,
-            "-c:v", "copy", "-c:a", "aac", "-strict", "experimental", "-map", "0:v:0", "-map", "1:a:0", final_video
-        ]
-        process_video_merge = await asyncio.create_subprocess_exec(*merge_video_command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        await process_video_merge.communicate()
-
-        if process_video_merge.returncode == 0:
-            print(f"🎬 ✅ Final dubbed video created: {final_video}")
-            return final_video
+        # 4. Build filter graph
+        if not converted_segments:
+            # Just use silent audio
+            filter_complex = "anullsrc=channel_layout=stereo:sample_rate=44100[aout]"
         else:
-            raise RuntimeError("⚠️ Error merging adjusted audio with video.")
+            filter_chains = []
+            inputs = [silent_audio]
+            for idx, (seg_path, start_time) in enumerate(converted_segments):
+                filter_chains.append(
+                    f"[{idx+1}:a]adelay={int(start_time*1000)}|{int(start_time*1000)}[a{idx}]"
+                )
+                inputs.append(seg_path)
+            mix_inputs = "".join(f"[a{idx}]" for idx in range(len(converted_segments)))
+            filter_complex = ";".join(filter_chains) + f";{mix_inputs}amix=inputs={len(converted_segments)}:duration=longest[aout]"
+
+        # 5. Merge audio tracks
+        merged_audio = os.path.join(TEMP_DIR, "final_audio.wav")
+        merge_cmd = [
+            "ffmpeg", "-y",
+            "-i", silent_audio,
+            *[arg for pair in [["-i", f] for f, _ in converted_segments] for arg in pair],
+            "-filter_complex", filter_complex,
+            "-map", "[aout]",
+            "-ac", "2",  # Output stereo
+            "-ar", "44100",
+            "-acodec", "pcm_s16le",
+            merged_audio
+        ]
+        merge_process = await asyncio.create_subprocess_exec(*merge_cmd)
+        await merge_process.wait()
+        temp_files.append(merged_audio)
+
+        # 6. Merge with video
+        merge_video_cmd = [
+            "ffmpeg", "-y",
+            "-i", video_no_audio,
+            "-i", merged_audio,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-ar", "44100",
+            "-ac", "2",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-shortest",
+            final_video
+        ]
+        video_process = await asyncio.create_subprocess_exec(*merge_video_cmd)
+        await video_process.wait()
+
+        # Cleanup temporary files
+        for f in temp_files:
+            if os.path.exists(f):
+                os.remove(f)
+
+        return final_video
 
     except Exception as e:
-        print(f"⚠️ Exception in merge_audio_with_video: {e}")
+        print(f"Error in merge_audio_with_video: {str(e)}")
+        # Cleanup on error
+        for f in temp_files:
+            if os.path.exists(f):
+                os.remove(f)
         raise
