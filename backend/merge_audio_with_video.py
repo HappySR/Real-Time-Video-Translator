@@ -4,6 +4,9 @@ import os
 import uuid
 import subprocess
 import logging
+import pysrt
+from itertools import chain
+import shutil
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -12,178 +15,188 @@ logger = logging.getLogger(__name__)
 TEMP_DIR = os.path.abspath("temp")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-async def merge_audio_segments(audio_segments, output_audio):
-    """Merges audio segments with proper path handling and format conversion"""
+async def get_video_duration(video_path):
+    """Get video duration in seconds"""
     try:
-        # Validate input
-        if not audio_segments:
-            raise ValueError("No audio segments provided for merging")
+        probe = await asyncio.to_thread(ffmpeg.probe, video_path)
+        return float(probe["format"]["duration"])
+    except Exception as e:
+        logger.error(f"Failed to get video duration: {str(e)}")
+        raise
 
-        # Create temporary files list
+async def merge_audio_segments(audio_segments, srt_path, video_duration, output_audio):
+    """Merge audio segments with proper timing from SRT file"""
+    try:
+        # Validate inputs
+        if not audio_segments or not os.path.exists(srt_path):
+            raise ValueError("Invalid audio segments or SRT path")
+
+        subs = pysrt.open(srt_path)
+        if len(audio_segments) != len(subs):
+            raise ValueError("Audio segments and subtitles count mismatch")
+
+        inputs = []
         temp_files = []
-        concat_list = os.path.join(TEMP_DIR, f"concat_{uuid.uuid4().hex}.txt")
+        filter_chains = []
 
-        # Prepare all segments with consistent format
-        with open(concat_list, "w") as f:
-            for seg in audio_segments:
-                # Handle both tuple and string paths
-                seg_path = seg[0] if isinstance(seg, tuple) else seg
-                seg_path = os.path.abspath(seg_path)
+        # Process each segment with proper timing
+        for idx, (seg_path, sub) in enumerate(zip(audio_segments, subs)):
+            seg_path = seg_path[0] if isinstance(seg_path, tuple) else seg_path
+            if not os.path.exists(seg_path):
+                logger.warning(f"Skipping missing segment {idx}: {seg_path}")
+                continue
 
-                if not os.path.exists(seg_path):
-                    logger.warning(f"⚠️ Segment not found: {seg_path}")
-                    continue
+            # Calculate timing from SRT (in seconds)
+            start = sub.start.ordinal / 1000
+            end = sub.end.ordinal / 1000
+            duration = end - start
 
-                # Convert to consistent MP3 format
-                temp_file = os.path.join(TEMP_DIR, f"conv_{uuid.uuid4().hex}.mp3")
-                temp_files.append(temp_file)
+            if duration <= 0:
+                logger.warning(f"Skipping invalid duration {duration}s for segment {idx}")
+                continue
 
-                convert_cmd = [
-                    "ffmpeg", "-y", "-i", seg_path,
-                    "-acodec", "libmp3lame", "-ar", "44100",
-                    "-ac", "1", "-b:a", "192k", temp_file
-                ]
+            processed = os.path.join(TEMP_DIR, f"seg_{uuid.uuid4().hex}.wav")
+            inputs.extend(["-i", seg_path])
+            
+            # Create filter chain for this segment
+            filter_chains.append(
+                f"[{len(inputs)//2 - 1}:a]atrim=0:{duration},"
+                f"asetpts=N/SR/TB,"
+                f"adelay={int(start*1000)}|{int(start*1000)},"
+                f"apad=whole_dur={video_duration}[a{idx}]"
+            )
+            temp_files.append(processed)
 
-                try:
-                    process = await asyncio.create_subprocess_exec(
-                        *convert_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE
-                    )
-                    stdout, stderr = await process.communicate()
-
-                    if process.returncode != 0:
-                        logger.error(f"⚠️ Conversion failed for {seg_path}: {stderr.decode()}")
-                        continue
-
-                    if os.path.exists(temp_file):
-                        f.write(f"file '{temp_file}'\n")
-                    else:
-                        logger.error(f"⚠️ Converted file not created: {temp_file}")
-
-                except Exception as e:
-                    logger.error(f"⚠️ Error converting {seg_path}: {str(e)}")
-                    continue
-
-        # Check if we have any valid segments
-        if os.path.getsize(concat_list) == 0:
+        if not filter_chains:
             raise ValueError("No valid audio segments to merge")
 
-        # Merge using concat protocol
-        merge_cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_list, "-c", "copy", output_audio
-        ]
+        # Build final filtergraph
+        mix_inputs = "".join([f"[a{i}]" for i in range(len(filter_chains))])
+        filtergraph = ";".join(filter_chains) + f";{mix_inputs}amix=inputs={len(filter_chains)}:duration=longest[outa]"
 
-        process = await asyncio.create_subprocess_exec(
-            *merge_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
+        # Execute FFmpeg
+        await run_command([
+            "ffmpeg", "-y",
+            *inputs,
+            "-filter_complex", filtergraph,
+            "-map", "[outa]",
+            "-c:a", "libmp3lame", "-b:a", "192k",
+            output_audio
+        ])
 
-        if process.returncode != 0:
-            raise RuntimeError(f"Merge failed: {stderr.decode()}")
-
-        logger.info(f"✅ Successfully merged audio to {output_audio}")
         return output_audio
 
     except Exception as e:
-        logger.error(f"❌ Error in merge_audio_segments: {str(e)}")
+        logger.error(f"Audio merge failed: {str(e)}", exc_info=True)
         raise
     finally:
-        # Cleanup temporary files
-        for f in temp_files + [concat_list]:
-            try:
-                if os.path.exists(f):
+        cleanup(temp_files)
+
+async def run_command(cmd):
+    """Robust command executor with full diagnostics"""
+    logger.debug(f"Executing: {' '.join(cmd)}")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    
+    if proc.returncode != 0:
+        error_msg = stderr.decode().strip()
+        logger.error(f"Command failed ({proc.returncode}): {error_msg}")
+        raise RuntimeError(f"FFmpeg error: {error_msg}")
+    
+    return stdout
+
+def cleanup(files):
+    """Atomic file cleanup with existence checks"""
+    for f in files:
+        try:
+            if os.path.exists(f):
+                if os.path.isdir(f):
+                    shutil.rmtree(f)
+                else:
                     os.remove(f)
-            except Exception as e:
-                logger.warning(f"⚠️ Cleanup error for {f}: {str(e)}")
+        except Exception as e:
+            logger.warning(f"Cleanup error for {f}: {str(e)}")
 
 async def adjust_audio_duration(segment_path, target_duration):
-    """Adjusts audio segment duration precisely using ffmpeg filters"""
+    """Adjust audio duration safely"""
     try:
         if not os.path.exists(segment_path):
-            raise FileNotFoundError(f"Audio segment not found: {segment_path}")
+            raise FileNotFoundError(f"Audio not found: {segment_path}")
 
-        # Get current duration
         probe = await asyncio.to_thread(ffmpeg.probe, segment_path)
         current_duration = float(probe["format"]["duration"])
-
-        if current_duration <= 0:
-            raise ValueError(f"Invalid duration: {current_duration}")
-
-        # Calculate speed factor with limits
-        speed_factor = current_duration / target_duration
-        speed_factor = max(0.5, min(2.0, speed_factor))  # Keep within reasonable bounds
-
-        # Build atempo filter chain
-        atempo_filters = []
-        while speed_factor > 2.0:
-            atempo_filters.append("atempo=2.0")
-            speed_factor /= 2.0
-        while speed_factor < 0.5:
-            atempo_filters.append("atempo=0.5")
-            speed_factor *= 2.0
-        atempo_filters.append(f"atempo={speed_factor:.3f}")
-
-        adjusted_path = os.path.join(TEMP_DIR, f"adjusted_{uuid.uuid4().hex}.mp3")
         
-        cmd = [
+        if current_duration <= 0.01 or target_duration <= 0.01:
+            raise ValueError(f"Invalid durations: {current_duration}s -> {target_duration}s")
+
+        speed_factor = max(0.5, min(2.0, current_duration / target_duration))
+        
+        adjusted_path = os.path.join(TEMP_DIR, f"adj_{uuid.uuid4().hex}.mp3")
+        await run_command([
             "ffmpeg", "-y", "-i", segment_path,
-            "-filter:a", ",".join(atempo_filters),
+            "-af", f"atempo={speed_factor:.3f}",
             "-c:a", "libmp3lame", "-b:a", "192k",
             adjusted_path
-        ]
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            raise RuntimeError(f"Adjustment failed: {stderr.decode()}")
-
+        ])
+        
         return adjusted_path
 
     except Exception as e:
-        logger.error(f"❌ Error adjusting audio duration: {str(e)}")
+        logger.error(f"Duration adjustment failed: {str(e)}", exc_info=True)
         raise
 
 async def merge_audio_with_video(video_no_audio, merged_audio_path, final_video):
-    """Merges audio with video while maintaining sync"""
+    """Merge audio and video with sync protection"""
     try:
-        if not os.path.exists(video_no_audio):
-            raise FileNotFoundError(f"Video file not found: {video_no_audio}")
-        if not os.path.exists(merged_audio_path):
-            raise FileNotFoundError(f"Audio file not found: {merged_audio_path}")
+        if not all(os.path.exists(f) for f in [video_no_audio, merged_audio_path]):
+            raise FileNotFoundError("Missing input files")
 
-        cmd = [
+        await run_command([
             "ffmpeg", "-y",
             "-i", video_no_audio,
             "-i", merged_audio_path,
             "-c:v", "copy",
             "-c:a", "aac",
             "-b:a", "192k",
+            "-movflags", "+faststart",
             "-shortest",
             final_video
-        ]
+        ])
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            raise RuntimeError(f"Final merge failed: {stderr.decode()}")
-
-        logger.info(f"✅ Successfully created final video: {final_video}")
+        logger.info(f"✅ Final video created: {final_video}")
         return final_video
 
     except Exception as e:
-        logger.error(f"❌ Error in merge_audio_with_video: {str(e)}")
+        logger.error(f"Video merge failed: {str(e)}", exc_info=True)
+        raise
+
+async def process_video(video_path, audio_segments, srt_path, output_video):
+    """Complete processing pipeline example"""
+    try:
+        # Get video duration
+        duration = await get_video_duration(video_path)
+        
+        # Process audio
+        merged_audio = os.path.join(TEMP_DIR, "merged_audio.mp3")
+        await merge_audio_segments(
+            audio_segments=audio_segments,
+            srt_path=srt_path,
+            video_duration=duration,
+            output_audio=merged_audio
+        )
+        
+        # Merge with video
+        await merge_audio_with_video(
+            video_no_audio=video_path,
+            merged_audio_path=merged_audio,
+            final_video=output_video
+        )
+        
+        return output_video
+    except Exception as e:
+        logger.error(f"Video processing failed: {str(e)}")
         raise

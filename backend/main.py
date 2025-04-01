@@ -9,7 +9,11 @@ from transcribe_audio import transcribe_audio
 from translate_text import translate_text
 from generate_subtitles import generate_srt
 from text_to_speech import generate_tts_segments
-from merge_audio_with_video import merge_audio_with_video, merge_audio_segments
+from merge_audio_with_video import (
+    merge_audio_with_video, 
+    merge_audio_segments,
+    get_video_duration
+)
 
 app = FastAPI()
 
@@ -19,12 +23,6 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 def _group_segments_into_chunks(segments: list) -> list:
     """
     Groups segments into timing-preserved chunks for TTS generation.
-    
-    Args:
-        segments: List of transcribed segments
-        
-    Returns:
-        List of chunks with combined text and original timing
     """
     chunks = []
     current_chunk = None
@@ -37,7 +35,6 @@ def _group_segments_into_chunks(segments: list) -> list:
                 "end": segment["end"]
             }
         else:
-            # Merge if within the same timing block (same start/end)
             if segment["start"] == current_chunk["start"] and segment["end"] == current_chunk["end"]:
                 current_chunk["texts"].append(segment["text"])
             else:
@@ -88,31 +85,31 @@ async def process_video(
         if not await extract_audio(video_path, audio_path):
             raise HTTPException(status_code=500, detail="Audio extraction failed")
 
-        # Transcribe audio with word-level timestamps
+        # Get video duration
+        video_duration = await get_video_duration(video_path)
+
+        # Transcribe audio
         segments = await transcribe_audio(audio_path)
         if not segments:
             raise HTTPException(status_code=500, detail="Audio transcription failed")
 
-        # Generate English subtitles (preserve original timing chunks)
+        # Generate English subtitles
         srt_path_en = video_path.rsplit(".", 1)[0] + "_en.srt"
         await generate_srt(segments, srt_path_en)
 
-        # Translate segments while preserving timing chunks
+        # Translate segments
         translated_chunks = []
         original_chunks = _group_segments_into_chunks(segments)
         
         for chunk in original_chunks:
             try:
-                # Combine all text in the chunk for translation
                 combined_text = " ".join(chunk["texts"])
                 translation_result = await translate_text(combined_text, target_language)
                 translated_text = translation_result["translated_text"]
                 
-                # Handle both string and list responses
                 if isinstance(translated_text, list):
                     translated_text = " ".join([str(t) for t in translated_text])
                 
-                # Clean and validate
                 translated_text = str(translated_text).replace("\n", " ").strip()[:500]
 
                 translated_chunks.append({
@@ -122,7 +119,7 @@ async def process_video(
                 })
             except Exception as e:
                 print(f"⚠️ Translation error: {e}")
-                translated_chunks.append(chunk)  # Fallback to original
+                translated_chunks.append(chunk)
 
         # Generate translated subtitles
         srt_path_translated = video_path.rsplit(".", 1)[0] + f"_{target_language}.srt"
@@ -135,17 +132,22 @@ async def process_video(
             })
         await generate_srt(translated_segments, srt_path_translated)
 
-        # Process TTS for complete chunks (preserving timing blocks)
+        # Generate TTS segments
         segment_tts_paths = await generate_tts_segments(
             translated_chunks,
             TEMP_DIR,
             target_language
         )
 
-        # Merge audio segments
+        # Merge audio segments with SRT timing
         if segment_tts_paths:
             merged_tts_path = video_path.rsplit(".", 1)[0] + f"_{target_language}_merged.mp3"
-            await merge_audio_segments([seg[0] for seg in segment_tts_paths], merged_tts_path)
+            await merge_audio_segments(
+                audio_segments=[seg[0] for seg in segment_tts_paths],
+                srt_path=srt_path_translated,
+                video_duration=video_duration,
+                output_audio=merged_tts_path
+            )
 
         # Create video without audio
         final_video_no_audio = video_path.rsplit(".", 1)[0] + "_no_audio.mp4"
