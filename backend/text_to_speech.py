@@ -52,8 +52,10 @@ async def generate_tts_segments(chunks: list, output_dir: str, target_language: 
 
     for idx, chunk in enumerate(chunks):
         try:
-            # Combine all phrases in the chunk
+            # Combine all phrases in the chunk and clean brackets
             full_text = " ".join(chunk["texts"])
+            # Remove surrounding square brackets
+            full_text = full_text.strip('[]')  # <-- ADD THIS LINE
             duration = chunk["end"] - chunk["start"]
             
             output_path = os.path.join(
@@ -80,19 +82,20 @@ async def generate_tts_segments(chunks: list, output_dir: str, target_language: 
 async def text_to_speech(text, output_audio_path, target_language=None, duration=None, max_retries=3):
     """Converts text to speech with post-processing duration control"""
     try:
+        cleaned_text = text.strip("['']")
         if not text.strip():
             raise ValueError("❌ Empty text input for TTS")
 
         if not os.path.exists(SPEAKER_WAV):
             raise FileNotFoundError(f"❌ Speaker WAV file not found: {SPEAKER_WAV}")
 
-        detected_lang = target_language if target_language else await detect_language(text)
+        detected_lang = target_language if target_language else await detect_language(cleaned_text)
         coqui_lang = LANGUAGE_MAP.get(detected_lang.lower(), "en")
 
         command = [
             "tts",
             "--model_name", "tts_models/multilingual/multi-dataset/xtts_v2",
-            "--text", text,
+            "--text", cleaned_text,
             "--out_path", output_audio_path,
             "--speaker_wav", SPEAKER_WAV,
             "--language_idx", coqui_lang
@@ -104,7 +107,7 @@ async def text_to_speech(text, output_audio_path, target_language=None, duration
         # Generate initial TTS without speed adjustment
         for attempt in range(max_retries):
             try:
-                print(f"🔊 TTS attempt {attempt + 1} for: {text[:50]}...")
+                print(f"🔊 TTS attempt {attempt + 1} for: {cleaned_text[:50]}...")
                 
                 process = await asyncio.create_subprocess_exec(
                     *command,
