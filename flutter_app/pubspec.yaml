@@ -1,9 +1,0 @@
-name: flutter_app
-description: A simple Flutter app to upload videos and get transcripts.
-
-dependencies:
-  flutter:
-    sdk: flutter
-
-  http: ^0.13.3 
-  image_picker: ^0.8.5+3 
