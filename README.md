@@ -77,7 +77,9 @@ All temporary files (audio clips, transcriptions, intermediate files) are automa
 
 ## 📄 License
 
-This project is open-source and available under the [MIT License](LICENSE).
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**. Feel free to use, modify, and distribute it.  
+
+📄 [Full License Text](https://www.gnu.org/licenses/agpl-3.0.txt)
 
 ---
 
