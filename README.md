@@ -1,4 +1,4 @@
-# 🎥 Real-Time Video Translation
+# 🎥 Real-Time Video Translator
 
 A fully automated pipeline for real-time translation and voice-over of videos. This project extracts the audio from a given video, transcribes it, translates it into the desired language, and regenerates audio using text-to-speech — all while maintaining accurate timing and seamless reintegration into the video.
 
